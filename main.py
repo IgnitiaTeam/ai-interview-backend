@@ -24,6 +24,7 @@ from models.subject_master import SubjectMaster
 from routes.jd_schedule import router as jd_schedule_router
 load_dotenv()
 
+
 # ---------------- IMPORTS ----------------
 from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, APIRouter, Form, WebSocket, WebSocketDisconnect, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +33,11 @@ from sqlalchemy.orm import Query, Session
 
 import cv2
 import numpy as np
-# import mediapipe as mp
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from pathlib import Path
+from ultralytics import YOLO
 import uuid
 import random
 import json
@@ -45,6 +50,7 @@ from routes.memberdashboard_routes import router as memberdashboard_router
 from routes.auth_routes import router as auth_router
 from core.session_store import INTERVIEW_SESSIONS
 from routes.jd_route import router as jd_route
+from routes.jd_review import router as jd_review_router
 
 # 🛠️ CLEANED MODELS BLOCK
 from models.question import Question, CourseProgram # Pulls your validated enum directly from question.py
@@ -66,6 +72,280 @@ from routes import auth_routes as auth
 app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
+
+# ============================================================
+# AI PROCTORING MODEL PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+AI_MODELS_DIR = BASE_DIR / "ai_models"
+
+if not AI_MODELS_DIR.exists():
+    AI_MODELS_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+# ------------------------------------------------------------
+# MODEL FILE PATHS
+# ------------------------------------------------------------
+
+FACE_DETECTOR_MODEL = (
+    AI_MODELS_DIR / "face_detector.tflite"
+)
+
+FACE_LANDMARKER_MODEL = (
+    AI_MODELS_DIR / "face_landmarker.task"
+)
+
+print(
+    "📁 AI MODELS:",
+    AI_MODELS_DIR
+)
+
+print(
+    "📄 Face detector:",
+    FACE_DETECTOR_MODEL
+)
+
+print(
+    "📄 Face landmarker:",
+    FACE_LANDMARKER_MODEL
+)
+
+
+# ============================================================
+# VERIFY MODEL FILES
+# ============================================================
+
+if not FACE_DETECTOR_MODEL.exists():
+
+    print(
+        "❌ ERROR: face_detector.task NOT FOUND"
+    )
+
+    print(
+        "Expected:",
+        FACE_DETECTOR_MODEL
+    )
+
+else:
+
+    print(
+        "✅ face_detector.task found"
+    )
+
+
+if not FACE_LANDMARKER_MODEL.exists():
+
+    print(
+        "❌ ERROR: face_landmarker.task NOT FOUND"
+    )
+
+    print(
+        "Expected:",
+        FACE_LANDMARKER_MODEL
+    )
+
+else:
+
+    print(
+        "✅ face_landmarker.task found"
+    )
+
+
+# ============================================================
+# YOLO PROCTORING MODEL
+# ============================================================
+
+print(
+    "🔄 Loading YOLO proctoring model..."
+)
+
+try:
+
+    yolo_model = YOLO(
+        "yolo11n.pt"
+    )
+
+    print(
+        "✅ YOLO proctoring model loaded"
+    )
+
+except Exception as e:
+
+    print(
+        "❌ Failed to load YOLO model:",
+        str(e)
+    )
+
+    traceback.print_exc()
+
+    yolo_model = None
+
+
+# ============================================================
+# MEDIAPIPE FACE DETECTOR
+# ============================================================
+
+print(
+    "🔄 Loading MediaPipe Face Detector (optional)..."
+)
+
+face_detector = None
+
+try:
+
+    face_detector_options = (
+        vision.FaceDetectorOptions(
+
+            base_options=python.BaseOptions(
+                model_asset_path=str(
+                    FACE_DETECTOR_MODEL
+                )
+            ),
+
+            min_detection_confidence=0.5
+        )
+    )
+
+    face_detector = (
+        vision.FaceDetector.create_from_options(
+            face_detector_options
+        )
+    )
+
+    print(
+        "✅ MediaPipe Face Detector loaded"
+    )
+
+except Exception as e:
+
+    print(
+        "⚠️ MediaPipe Face Detector could not be loaded. "
+        "FaceLandmarker fallback will be used."
+    )
+
+    print(
+        str(e)
+    )
+
+    traceback.print_exc()
+
+    face_detector = None
+
+
+# ============================================================
+# MEDIAPIPE FACE LANDMARKER
+# ============================================================
+
+print(
+    "🔄 Loading MediaPipe Face Landmarker..."
+)
+
+face_landmarker = None
+
+try:
+
+    face_landmarker_options = (
+        vision.FaceLandmarkerOptions(
+
+            base_options=python.BaseOptions(
+                model_asset_path=str(
+                    FACE_LANDMARKER_MODEL
+                )
+            ),
+
+            running_mode=(
+                vision.RunningMode.IMAGE
+            ),
+
+            num_faces=2,
+
+            min_face_detection_confidence=0.5,
+
+            min_face_presence_confidence=0.5,
+
+            min_tracking_confidence=0.5,
+
+            output_face_blendshapes=True,
+
+            output_facial_transformation_matrixes=True
+        )
+    )
+
+    face_landmarker = (
+        vision.FaceLandmarker.create_from_options(
+            face_landmarker_options
+        )
+    )
+
+    print(
+        "✅ MediaPipe Face Landmarker loaded"
+    )
+
+except Exception as e:
+
+    print(
+        "❌ Failed to load MediaPipe Face Landmarker:"
+    )
+
+    print(
+        str(e)
+    )
+
+    traceback.print_exc()
+
+    face_landmarker = None
+
+
+# ============================================================
+# FINAL PROCTORING MODEL STATUS
+# ============================================================
+
+if face_landmarker is None:
+
+    print(
+        "❌ CRITICAL: MediaPipe Face Landmarker is unavailable. "
+        "Proctoring face checks cannot run."
+    )
+
+else:
+
+    print(
+        "✅ Proctoring face analysis ready "
+        "(FaceLandmarker active)."
+    )
+
+if face_detector is None:
+
+    print(
+        "ℹ️ Separate FaceDetector is unavailable; "
+        "FaceLandmarker will be used for face counting "
+        "and bounding-box estimation."
+    )
+
+
+# ============================================================
+# PROCTORING CONFIGURATION
+# ============================================================
+
+PROCTORING_FACE_CONFIDENCE = 0.5
+
+HEAD_YAW_THRESHOLD = 25.0
+
+HEAD_PITCH_THRESHOLD = 25.0
+
+HEAD_ROLL_THRESHOLD = 30.0
+
+MIN_FACE_AREA_RATIO = 0.03
+
+YOLO_CONFIDENCE = 0.45
+
+EYE_GAZE_HORIZONTAL_THRESHOLD = 0.22
+EYE_GAZE_VERTICAL_THRESHOLD = 0.22
+
 
 # ---------------- GEMINI CLIENT ----------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -94,7 +374,7 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 # ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*","http://172.146.1.40:4200"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -106,6 +386,7 @@ app.include_router(memberdashboard_router)
 app.include_router(auth_router)
 app.include_router(jd_route)
 app.include_router(jd_schedule_router)
+app.include_router(jd_review_router)
 # app.include_router(course_route)
 
 # mp_face_detection = mp.solutions.face_detection
@@ -335,28 +616,45 @@ def get_next_question(interview_id: str, category: str, db: Session = Depends(ge
 #         return {"corrected_text": answer}
            
 
-# ---------------- FACE DETECTION ----------------
-# @app.post("/detect-face")
-# async def detect_face(file: UploadFile = File(...)):
+# ============================================================
+# SIMPLE FACE DETECTION
+# ============================================================
 
-#     contents = await file.read()
-#     np_arr = np.frombuffer(contents, np.uint8)
-#     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+@app.post("/detect-face")
+async def detect_face(
+    file: UploadFile = File(...)
+):
 
-#     if image is None:
-#         return {"faces": 0}
+    try:
 
-#     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        frame = await read_uploaded_frame(file)
 
-#     with mp_face_detection.FaceDetection(
-#         model_selection=0,
-#         min_detection_confidence=0.5
-#     ) as fd:
-#         results = fd.process(rgb)
+        analysis = analyze_face(frame)
 
-#     faces = len(results.detections) if results.detections else 0
+        return {
+            "success": True,
+            "face_detected": analysis["face_visible"],
+            "face_count": analysis["face_count"],
+            "face_confidence": analysis["face_confidence"]
+        }
 
-#     return {"faces": faces}
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "❌ Face detection error:",
+            str(e)
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Face detection failed: {str(e)}"
+        )
+
 
 app.include_router(auth.router, prefix="/api/auth")
 
@@ -779,9 +1077,9 @@ async def websocket_audio(websocket: WebSocket):
 
             print("✅ Connected to AssemblyAI")
 
-            # ----------------------------------------
-            # Silence Countdown
-            # ----------------------------------------
+            # ============================================================
+            # SILENCE COUNTDOWN
+            # ============================================================
 
             async def silence_countdown():
 
@@ -789,7 +1087,9 @@ async def websocket_audio(websocket: WebSocket):
 
                     await asyncio.sleep(10)
 
-                    print("⏰ Candidate silent for 10 seconds")
+                    print(
+                        "⏰ Candidate silent for 10 seconds"
+                    )
 
                     await websocket.send_text(
                         json.dumps({
@@ -799,16 +1099,22 @@ async def websocket_audio(websocket: WebSocket):
 
                 except asyncio.CancelledError:
 
-                    print("🔄 Silence timer reset")
+                    print(
+                        "🔄 Silence timer reset"
+                    )
 
                 except Exception:
 
-                    print("❌ Error inside silence timer")
+                    print(
+                        "❌ Error inside silence timer"
+                    )
+
                     traceback.print_exc()
 
-            # ----------------------------------------
+            # ============================================================
             # SEND AUDIO
-            # ----------------------------------------
+            # Angular → Backend → AssemblyAI
+            # ============================================================
 
             async def send_audio():
 
@@ -818,32 +1124,48 @@ async def websocket_audio(websocket: WebSocket):
 
                     while True:
 
-                        chunk = await websocket.receive_bytes()
+                        chunk = (
+                            await websocket.receive_bytes()
+                        )
 
                         if not chunk:
                             continue
 
-                        print(f"📤 Audio Chunk: {len(chunk)} bytes")
+                        print(
+                            f"📤 Audio Chunk: "
+                            f"{len(chunk)} bytes"
+                        )
 
-                        await assembly_ws.send(chunk)
+                        await assembly_ws.send(
+                            chunk
+                        )
 
                 except WebSocketDisconnect:
 
-                    print("❌ Angular WebSocket disconnected")
+                    print(
+                        "❌ Angular WebSocket disconnected"
+                    )
 
                 except Exception:
 
-                    print("❌ send_audio() crashed")
+                    print(
+                        "❌ send_audio() crashed"
+                    )
+
                     traceback.print_exc()
 
                 finally:
 
-                    if silence_task and not silence_task.done():
+                    if (
+                        silence_task
+                        and not silence_task.done()
+                    ):
                         silence_task.cancel()
 
-            # ----------------------------------------
+            # ============================================================
             # RECEIVE TRANSCRIPTS
-            # ----------------------------------------
+            # AssemblyAI → Backend → Angular
+            # ============================================================
 
             async def receive_transcript():
 
@@ -854,45 +1176,160 @@ async def websocket_audio(websocket: WebSocket):
 
                     async for message in assembly_ws:
 
+                        # ------------------------------------------------
+                        # PARSE ASSEMBLYAI MESSAGE
+                        # ------------------------------------------------
+
                         try:
-                            data = json.loads(message)
+
+                            data = json.loads(
+                                message
+                            )
 
                         except Exception:
 
-                            print("⚠️ Invalid JSON received")
+                            print(
+                                "⚠️ Invalid JSON received"
+                            )
+
                             print(message)
 
                             continue
 
-                        print("📩 AssemblyAI:", data)
+                        print(
+                            "📩 AssemblyAI:",
+                            data
+                        )
+
+                        # ------------------------------------------------
+                        # ONLY PROCESS TURN MESSAGES
+                        # ------------------------------------------------
 
                         if data.get("type") != "Turn":
                             continue
 
-                        transcript = data.get(
-                            "transcript",
-                            ""
-                        ).strip()
+                        transcript = (
+                            data.get(
+                                "transcript",
+                                ""
+                            )
+                            .strip()
+                        )
 
-                        if transcript:
+                        end_of_turn = bool(
+                            data.get(
+                                "end_of_turn",
+                                False
+                            )
+                        )
+
+                        # ------------------------------------------------
+                        # NO TRANSCRIPT
+                        # ------------------------------------------------
+
+                        if not transcript:
+
+                            # Still notify Angular if
+                            # AssemblyAI indicates end of turn.
+                            if end_of_turn:
+
+                                await websocket.send_text(
+                                    json.dumps({
+                                        "type": "transcript",
+                                        "transcript": "",
+                                        "end_of_turn": True,
+                                        "final": True
+                                    })
+                                )
+
+                                print(
+                                    "🏁 Empty end_of_turn received"
+                                )
+
+                            continue
+
+                        # ------------------------------------------------
+                        # CANDIDATE HAS STARTED SPEAKING
+                        # ------------------------------------------------
+
+                        if not candidate_started:
 
                             candidate_started = True
 
-                            print("🎤 Speech:", transcript)
-
-                            # if silence_task and not silence_task.done():
-                            #     silence_task.cancel()
-
-                            # silence_task = asyncio.create_task(
-                            #     silence_countdown()
-                            # )
-
-                        if data.get("end_of_turn"):
-
-                            await websocket.send_text(
-                                json.dumps(data)
+                            print(
+                                "🎤 Candidate started speaking"
                             )
-                            print("📤 Sending transcript to Angular:", data["transcript"])
+
+                        # ------------------------------------------------
+                        # LOG TRANSCRIPT
+                        # ------------------------------------------------
+
+                        if end_of_turn:
+
+                            print(
+                                "✅ FINAL STT:",
+                                transcript
+                            )
+
+                        else:
+
+                            print(
+                                "📝 PARTIAL STT:",
+                                transcript
+                            )
+
+                        # ------------------------------------------------
+                        # SEND TO ANGULAR IMMEDIATELY
+                        #
+                        # IMPORTANT:
+                        # Do NOT wait for end_of_turn here.
+                        # Angular receives the latest partial transcript
+                        # while candidate is still speaking.
+                        # ------------------------------------------------
+
+                        await websocket.send_text(
+                            json.dumps({
+
+                                "type": "transcript",
+
+                                "transcript":
+                                    transcript,
+
+                                "end_of_turn":
+                                    end_of_turn,
+
+                                "final":
+                                    end_of_turn
+
+                            })
+                        )
+
+                        print(
+                            "📤 Sending STT to Angular:",
+                            transcript,
+                            "| final:",
+                            end_of_turn
+                        )
+
+                        # ------------------------------------------------
+                        # END OF TURN
+                        # ------------------------------------------------
+
+                        if end_of_turn:
+
+                            print(
+                                "🏁 AssemblyAI end_of_turn"
+                            )
+
+                            # ------------------------------------------------
+                            # IMPORTANT:
+                            #
+                            # Do NOT append anything here.
+                            #
+                            # Angular will use this message to replace
+                            # the current partial transcript with the
+                            # finalized transcript.
+                            # ------------------------------------------------
 
                 except websockets.ConnectionClosed as e:
 
@@ -904,17 +1341,24 @@ async def websocket_audio(websocket: WebSocket):
 
                 except Exception:
 
-                    print("❌ receive_transcript() crashed")
+                    print(
+                        "❌ receive_transcript() crashed"
+                    )
+
                     traceback.print_exc()
 
                 finally:
 
-                    if silence_task and not silence_task.done():
+                    if (
+                        silence_task
+                        and not silence_task.done()
+                    ):
+
                         silence_task.cancel()
 
-            # ----------------------------------------
-            # RUN BOTH TASKS
-            # ----------------------------------------
+            # ============================================================
+            # RUN AUDIO + TRANSCRIPT TASKS
+            # ============================================================
 
             await asyncio.gather(
                 send_audio(),
@@ -923,13 +1367,17 @@ async def websocket_audio(websocket: WebSocket):
 
     except Exception:
 
-        print("❌ websocket_audio() crashed")
+        print(
+            "❌ websocket_audio() crashed"
+        )
+
         traceback.print_exc()
 
     finally:
 
-        print("🔴 websocket_audio() finished")
-
+        print(
+            "🔴 websocket_audio() finished"
+        )
         
 @app.post("/api/candidate/login")
 def candidate_login(payload: dict, db: Session = Depends(get_db)):
@@ -4825,3 +5273,1236 @@ def save_video_analysis(
         "message": "Video analysis saved successfully.",
         "id": record.id
     }
+
+# ============================================================
+# IMAGE HELPER
+# ============================================================
+
+async def read_uploaded_frame(file: UploadFile):
+
+    contents = await file.read()
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty image received."
+        )
+
+    np_arr = np.frombuffer(
+        contents,
+        np.uint8
+    )
+
+    frame = cv2.imdecode(
+        np_arr,
+        cv2.IMREAD_COLOR
+    )
+
+    if frame is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image frame."
+        )
+
+    return frame
+
+# ============================================================
+# MEDIAPIPE IMAGE CONVERSION
+# ============================================================
+
+def convert_to_mp_image(frame):
+
+    rgb_frame = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2RGB
+    )
+
+    return mp.Image(
+        image_format=mp.ImageFormat.SRGB,
+        data=rgb_frame
+    )
+
+
+# ============================================================
+# FACE BOUNDING BOX FROM LANDMARKS
+# ============================================================
+
+def get_landmark_bbox(face_landmarks, frame_width, frame_height):
+
+    if not face_landmarks:
+        return None
+
+    xs = []
+    ys = []
+
+    for landmark in face_landmarks:
+
+        x = max(0.0, min(1.0, float(landmark.x)))
+        y = max(0.0, min(1.0, float(landmark.y)))
+
+        xs.append(x * frame_width)
+        ys.append(y * frame_height)
+
+    if not xs or not ys:
+        return None
+
+    left = min(xs)
+    right = max(xs)
+    top = min(ys)
+    bottom = max(ys)
+
+    return {
+        "x": left,
+        "y": top,
+        "width": max(0.0, right - left),
+        "height": max(0.0, bottom - top)
+    }
+
+
+# ============================================================
+# MEDIAPIPE FACE ANALYSIS
+# ============================================================
+
+def analyze_face(frame):
+
+    # FaceLandmarker is the required detector for this backend.
+    # The separate FaceDetector is optional and, if available,
+    # provides a confidence score and native bounding boxes.
+    if face_landmarker is None:
+
+        raise RuntimeError(
+            "MediaPipe Face Landmarker is not initialized. "
+            "Check the face_landmarker.task model and startup logs."
+        )
+
+    mp_image = convert_to_mp_image(frame)
+
+    # --------------------------------------------------------
+    # LANDMARKER ALSO DETECTS FACES
+    # --------------------------------------------------------
+
+    landmark_result = face_landmarker.detect(mp_image)
+
+    landmark_faces = (
+        landmark_result.face_landmarks
+        if landmark_result
+        else []
+    )
+
+    face_count = len(landmark_faces)
+
+    face_visible = face_count > 0
+
+    # --------------------------------------------------------
+    # OPTIONAL NATIVE FACE DETECTOR
+    # --------------------------------------------------------
+
+    detections = []
+
+    if face_detector is not None:
+
+        try:
+
+            detection_result = face_detector.detect(mp_image)
+
+            detections = (
+                detection_result.detections
+                if detection_result
+                else []
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ FaceDetector failed during frame analysis; "
+                "using FaceLandmarker fallback:",
+                str(e)
+            )
+
+    # --------------------------------------------------------
+    # FACE CONFIDENCE
+    # --------------------------------------------------------
+
+    face_confidence = 0.0
+
+    if detections:
+
+        confidence_values = []
+
+        for detection in detections:
+
+            if not detection.categories:
+                continue
+
+            confidence_values.append(
+                float(detection.categories[0].score)
+            )
+
+        if confidence_values:
+            face_confidence = max(confidence_values)
+
+    elif face_count > 0:
+
+        # FaceLandmarker has already accepted the face.
+        # There is no FaceDetector score in the fallback path.
+        face_confidence = 1.0
+
+    # --------------------------------------------------------
+    # FACE SIZE
+    # --------------------------------------------------------
+
+    frame_height, frame_width = frame.shape[:2]
+
+    face_area_ratio = 0.0
+
+    if face_count == 1:
+
+        if detections:
+
+            bbox = detections[0].bounding_box
+
+            face_width = float(bbox.width)
+            face_height = float(bbox.height)
+
+        else:
+
+            bbox = get_landmark_bbox(
+                landmark_faces[0],
+                frame_width,
+                frame_height
+            )
+
+            face_width = (
+                bbox["width"]
+                if bbox
+                else 0.0
+            )
+
+            face_height = (
+                bbox["height"]
+                if bbox
+                else 0.0
+            )
+
+        face_area = face_width * face_height
+        frame_area = frame_width * frame_height
+
+        if frame_area > 0:
+            face_area_ratio = face_area / frame_area
+
+    face_too_small = (
+        face_count == 1
+        and face_area_ratio < MIN_FACE_AREA_RATIO
+    )
+
+    return {
+        "face_count": face_count,
+        "face_visible": face_visible,
+        "face_confidence": round(face_confidence, 3),
+        "face_area_ratio": round(face_area_ratio, 4),
+        "face_too_small": face_too_small,
+        "landmark_result": landmark_result,
+        "landmark_faces": landmark_faces
+    }
+
+
+# ============================================================
+# HEAD POSE
+# ============================================================
+
+def calculate_head_pose(landmark_result):
+
+    default_pose = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "roll": 0.0
+    }
+
+    if landmark_result is None:
+        return default_pose
+
+    matrices = (
+        landmark_result
+        .facial_transformation_matrixes
+    )
+
+    if not matrices:
+        return default_pose
+
+    try:
+
+        matrix = np.array(
+            matrices[0],
+            dtype=np.float64
+        )
+
+        # ----------------------------------------------------
+        # MediaPipe normally provides a 4x4 transformation
+        # matrix.
+        # ----------------------------------------------------
+
+        if matrix.shape != (4, 4):
+
+            return default_pose
+
+        rotation_matrix = matrix[:3, :3]
+
+        # OpenCV Euler decomposition
+        angles, _, _, _, _, _ = cv2.RQDecomp3x3(
+            rotation_matrix
+        )
+
+        pitch = float(angles[0])
+        yaw = float(angles[1])
+        roll = float(angles[2])
+
+        return {
+            "yaw": round(yaw, 2),
+            "pitch": round(pitch, 2),
+            "roll": round(roll, 2)
+        }
+
+    except Exception as e:
+
+        print(
+            "⚠️ Head pose calculation error:",
+            str(e)
+        )
+
+        return default_pose
+
+# ============================================================
+# LOOKING AWAY DETECTION
+# ============================================================
+
+def detect_looking_away(head_pose):
+
+    yaw = abs(
+        float(head_pose.get("yaw", 0))
+    )
+
+    pitch = abs(
+        float(head_pose.get("pitch", 0))
+    )
+
+    roll = abs(
+        float(head_pose.get("roll", 0))
+    )
+
+    yaw_away = (
+        yaw > HEAD_YAW_THRESHOLD
+    )
+
+    pitch_away = (
+        pitch > HEAD_PITCH_THRESHOLD
+    )
+
+    roll_away = (
+        roll > HEAD_ROLL_THRESHOLD
+    )
+
+    looking_away = (
+        yaw_away
+        or pitch_away
+        or roll_away
+    )
+
+    return {
+        "looking_away": looking_away,
+
+        "yaw_exceeded": yaw_away,
+
+        "pitch_exceeded": pitch_away,
+
+        "roll_exceeded": roll_away
+    }
+
+# ============================================================
+# YOLO PROCTORING DETECTION
+# ============================================================
+
+def analyze_yolo_objects(frame):
+
+    result = {
+        "person_count": 0,
+        "phone_detected": False,
+        "phone_confidence": 0.0,
+        "objects": []
+    }
+
+    if yolo_model is None:
+
+        return result
+
+    try:
+
+        predictions = yolo_model(
+            frame,
+            verbose=False,
+            conf=YOLO_CONFIDENCE
+        )
+
+        for prediction in predictions:
+
+            if prediction.boxes is None:
+                continue
+
+            for box in prediction.boxes:
+
+                class_id = int(
+                    box.cls[0].item()
+                )
+
+                confidence = float(
+                    box.conf[0].item()
+                )
+
+                class_name = (
+                    yolo_model.names[class_id]
+                    if class_id in yolo_model.names
+                    else str(class_id)
+                )
+
+                result["objects"].append({
+                    "class": class_name,
+                    "confidence": round(
+                        confidence,
+                        3
+                    )
+                })
+
+                # --------------------------------------------
+                # PERSON
+                # --------------------------------------------
+
+                if class_name == "person":
+
+                    result["person_count"] += 1
+
+                # --------------------------------------------
+                # MOBILE PHONE
+                # --------------------------------------------
+
+                if class_name == "cell phone":
+
+                    result["phone_detected"] = True
+
+                    result["phone_confidence"] = max(
+                        result["phone_confidence"],
+                        confidence
+                    )
+
+    except Exception as e:
+
+        print(
+            "❌ YOLO proctoring error:",
+            str(e)
+        )
+
+    return result
+
+# ============================================================
+# COMPLETE PROCTORING ANALYSIS
+# ============================================================
+
+def analyze_proctoring_frame(frame):
+
+    alerts = []
+
+    severity = "NORMAL"
+
+    # ========================================================
+    # FACE
+    # ========================================================
+
+    face_analysis = analyze_face(frame)
+
+    face_count = face_analysis[
+        "face_count"
+    ]
+
+    face_visible = face_analysis[
+        "face_visible"
+    ]
+
+    face_confidence = face_analysis[
+        "face_confidence"
+    ]
+
+    face_too_small = face_analysis[
+        "face_too_small"
+    ]
+
+    # ========================================================
+    # FACE NOT DETECTED
+    # ========================================================
+
+    if not face_visible:
+
+        alerts.append({
+            "code": "FACE_NOT_VISIBLE",
+            "message": (
+                "Candidate face is not visible."
+            ),
+            "severity": "HIGH"
+        })
+
+        severity = "HIGH"
+
+    # ========================================================
+    # MULTIPLE FACES
+    # ========================================================
+
+    if face_count > 1:
+
+        alerts.append({
+            "code": "MULTIPLE_FACES",
+            "message": (
+                "Multiple faces detected."
+            ),
+            "severity": "HIGH"
+        })
+
+        severity = "HIGH"
+
+    # ========================================================
+    # FACE TOO SMALL / FAR AWAY
+    # ========================================================
+
+    if face_too_small:
+
+        alerts.append({
+            "code": "FACE_TOO_FAR",
+            "message": (
+                "Please move closer to the camera."
+            ),
+            "severity": "WARNING"
+        })
+
+        if severity == "NORMAL":
+            severity = "WARNING"
+
+    # ========================================================
+    # HEAD POSE
+    # ========================================================
+
+    head_pose = {
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "roll": 0.0
+    }
+
+    looking_away = False
+
+    pose_status = {
+        "yaw_exceeded": False,
+        "pitch_exceeded": False,
+        "roll_exceeded": False
+    }
+
+    if (
+        face_count == 1
+        and len(face_analysis["landmark_faces"]) == 1
+    ):
+
+        head_pose = calculate_head_pose(
+            face_analysis["landmark_result"]
+        )
+
+        pose_status = detect_looking_away(
+            head_pose
+        )
+
+        looking_away = pose_status[
+            "looking_away"
+        ]
+
+        # ----------------------------------------------------
+        # HEAD LOOKING AWAY
+        # ----------------------------------------------------
+
+        if looking_away:
+
+            alerts.append({
+                "code": "LOOKING_AWAY",
+                "message": (
+                    "Candidate appears to be "
+                    "looking away from the camera."
+                ),
+                "severity": "WARNING"
+            })
+
+            if severity == "NORMAL":
+                severity = "WARNING"
+
+    # ========================================================
+    # EYE GAZE
+    # ========================================================
+
+    eye_gaze = {
+        "available": False,
+        "looking_away": False,
+        "direction": "CENTER",
+        "horizontal": 0.0,
+        "vertical": 0.0,
+        "left_eye": None,
+        "right_eye": None
+    }
+
+    if (
+        face_count == 1
+        and len(face_analysis["landmark_faces"]) == 1
+    ):
+
+        eye_gaze = detect_eye_gaze(
+            face_analysis["landmark_result"]
+        )
+
+        # ----------------------------------------------------
+        # EYE MOVEMENT / GAZE AWAY
+        # ----------------------------------------------------
+
+        if eye_gaze["looking_away"]:
+
+            direction = eye_gaze.get(
+                "direction",
+                "away"
+            )
+
+            alerts.append({
+                "code": "EYE_GAZE_AWAY",
+                "message": (
+                    "Candidate appears to be "
+                    f"looking {direction.lower()} "
+                    "away from the camera."
+                ),
+                "severity": "WARNING",
+                "direction": direction
+            })
+
+            if severity == "NORMAL":
+                severity = "WARNING"
+
+    # ========================================================
+    # YOLO
+    # ========================================================
+
+    yolo_analysis = analyze_yolo_objects(
+        frame
+    )
+
+    person_count = yolo_analysis[
+        "person_count"
+    ]
+
+    phone_detected = yolo_analysis[
+        "phone_detected"
+    ]
+
+    phone_confidence = yolo_analysis[
+        "phone_confidence"
+    ]
+
+    # ========================================================
+    # MULTIPLE PERSONS
+    # ========================================================
+
+    if person_count > 1:
+
+        alerts.append({
+            "code": "MULTIPLE_PERSONS",
+            "message": (
+                "More than one person is visible."
+            ),
+            "severity": "HIGH"
+        })
+
+        severity = "HIGH"
+
+    # ========================================================
+    # PHONE
+    # ========================================================
+
+    if phone_detected:
+
+        alerts.append({
+            "code": "PHONE_DETECTED",
+            "message": (
+                "Mobile phone detected."
+            ),
+            "severity": "HIGH",
+            "confidence": round(
+                phone_confidence,
+                3
+            )
+        })
+
+        severity = "HIGH"
+
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
+
+    result = {
+
+        "success": True,
+
+        # ----------------------------------------------------
+        # FACE
+        # ----------------------------------------------------
+
+        "face_count":
+            face_count,
+
+        "face_visible":
+            face_visible,
+
+        "face_confidence":
+            face_confidence,
+
+        "face_too_small":
+            face_too_small,
+
+        # ----------------------------------------------------
+        # HEAD
+        # ----------------------------------------------------
+
+        "head_pose":
+            head_pose,
+
+        "looking_away":
+            looking_away,
+
+        "pose_status":
+            pose_status,
+
+        # ----------------------------------------------------
+        # EYE GAZE
+        # ----------------------------------------------------
+
+        "eye_gaze":
+            eye_gaze,
+
+        # ----------------------------------------------------
+        # OBJECTS
+        # ----------------------------------------------------
+
+        "person_count":
+            person_count,
+
+        "phone_detected":
+            phone_detected,
+
+        "phone_confidence":
+            round(
+                phone_confidence,
+                3
+            ),
+
+        "objects":
+            yolo_analysis["objects"],
+
+        # ----------------------------------------------------
+        # ALERTS
+        # ----------------------------------------------------
+
+        "alerts":
+            alerts,
+
+        "alert_count":
+            len(alerts),
+
+        "severity":
+            severity
+    }
+
+    return make_json_safe(result)
+# ============================================================
+# PROCTORING - SINGLE FRAME
+# ============================================================
+
+@app.post("/api/proctoring/check-frame")
+async def check_proctoring_frame(
+    file: UploadFile = File(...)
+):
+
+    try:
+
+        frame = await read_uploaded_frame(
+            file
+        )
+
+        result = analyze_proctoring_frame(
+            frame
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "❌ Proctoring frame error:",
+            str(e)
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Proctoring analysis failed: {str(e)}"
+            )
+        )
+
+# ============================================================
+# PROCTORING - PRE CHECK
+# ============================================================
+
+@app.post("/api/proctoring/precheck")
+async def proctoring_precheck(
+    file: UploadFile = File(...)
+):
+
+    try:
+
+        frame = await read_uploaded_frame(file)
+
+        analysis = analyze_proctoring_frame(frame)
+
+        # ====================================================
+        # PRECHECK CONDITIONS
+        # ====================================================
+
+        face_check = bool(
+            analysis["face_count"] == 1
+        )
+
+        no_phone = bool(
+            not analysis["phone_detected"]
+        )
+
+        no_extra_person = bool(
+            analysis["person_count"] <= 1
+        )
+
+        face_visible = bool(
+            analysis["face_visible"]
+        )
+
+        face_size_ok = bool(
+            not analysis["face_too_small"]
+        )
+
+        looking_at_camera = bool(
+            not analysis["looking_away"]
+        )
+
+        # ====================================================
+        # ALL CHECKS
+        # ====================================================
+
+        checks = {
+
+            "face_detected":
+                face_visible,
+
+            "single_face":
+                face_check,
+
+            "face_size_ok":
+                face_size_ok,
+
+            "looking_at_camera":
+                looking_at_camera,
+
+            "no_phone":
+                no_phone,
+
+            "no_extra_person":
+                no_extra_person
+        }
+
+        # ====================================================
+        # PRECHECK RESULT
+        # ====================================================
+
+        precheck_passed = all(
+            checks.values()
+        )
+
+        # ====================================================
+        # USER MESSAGE
+        # ====================================================
+
+        if not face_visible:
+
+            message = (
+                "Please position your face "
+                "inside the camera frame."
+            )
+
+        elif not face_check:
+
+            message = (
+                "Only one face should be visible "
+                "during the assessment."
+            )
+
+        elif not face_size_ok:
+
+            message = (
+                "Please move closer to the camera."
+            )
+
+        elif not looking_at_camera:
+
+            message = (
+                "Please look directly at the camera."
+            )
+
+        elif not no_extra_person:
+
+            message = (
+                "Only the candidate should be "
+                "visible."
+            )
+
+        elif not no_phone:
+
+            message = (
+                "Please remove your mobile phone "
+                "from the camera view."
+            )
+
+        else:
+
+            message = (
+                "All camera and environment "
+                "checks passed."
+            )
+
+        # ====================================================
+        # FINAL RESPONSE
+        # ====================================================
+
+        response = {
+
+            "success": True,
+
+            "precheck_passed":
+                bool(precheck_passed),
+
+            "message":
+                message,
+
+            "checks":
+                checks,
+
+            "analysis":
+                analysis
+        }
+
+        return make_json_safe(response)
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "❌ Proctoring precheck error:",
+            str(e)
+        )
+
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Precheck failed: {str(e)}"
+        )
+
+
+# ============================================================
+# EYE GAZE DETECTION
+# ============================================================
+
+def detect_eye_gaze(landmark_result):
+
+    result = {
+        "available": False,
+        "looking_away": False,
+        "direction": "CENTER",
+        "horizontal": 0.0,
+        "vertical": 0.0,
+        "left_eye": None,
+        "right_eye": None
+    }
+
+    if landmark_result is None:
+        return result
+
+    if not landmark_result.face_landmarks:
+        return result
+
+    try:
+
+        landmarks = landmark_result.face_landmarks[0]
+
+        # MediaPipe iris landmarks
+        #
+        # Left iris: 468 - 472
+        # Right iris: 473 - 477
+
+        if len(landmarks) < 478:
+            return result
+
+        # ----------------------------------------------------
+        # IRIS CENTERS
+        # ----------------------------------------------------
+
+        left_iris_points = landmarks[468:473]
+        right_iris_points = landmarks[473:478]
+
+        left_iris_x = np.mean(
+            [p.x for p in left_iris_points]
+        )
+
+        left_iris_y = np.mean(
+            [p.y for p in left_iris_points]
+        )
+
+        right_iris_x = np.mean(
+            [p.x for p in right_iris_points]
+        )
+
+        right_iris_y = np.mean(
+            [p.y for p in right_iris_points]
+        )
+
+        # ----------------------------------------------------
+        # EYE CORNERS
+        # ----------------------------------------------------
+
+        # Left eye
+        left_inner = landmarks[133]
+        left_outer = landmarks[33]
+
+        # Right eye
+        right_inner = landmarks[362]
+        right_outer = landmarks[263]
+
+        # ----------------------------------------------------
+        # EYE TOP / BOTTOM
+        # ----------------------------------------------------
+
+        left_top = landmarks[159]
+        left_bottom = landmarks[145]
+
+        right_top = landmarks[386]
+        right_bottom = landmarks[374]
+
+        # ----------------------------------------------------
+        # HORIZONTAL NORMALIZATION
+        # ----------------------------------------------------
+
+        left_eye_width = abs(
+            left_outer.x - left_inner.x
+        )
+
+        right_eye_width = abs(
+            right_outer.x - right_inner.x
+        )
+
+        if (
+            left_eye_width <= 0
+            or right_eye_width <= 0
+        ):
+            return result
+
+        left_horizontal = (
+            left_iris_x - min(
+                left_inner.x,
+                left_outer.x
+            )
+        ) / left_eye_width
+
+        right_horizontal = (
+            right_iris_x - min(
+                right_inner.x,
+                right_outer.x
+            )
+        ) / right_eye_width
+
+        horizontal = (
+            left_horizontal +
+            right_horizontal
+        ) / 2.0
+
+        # ----------------------------------------------------
+        # VERTICAL NORMALIZATION
+        # ----------------------------------------------------
+
+        left_eye_height = abs(
+            left_bottom.y -
+            left_top.y
+        )
+
+        right_eye_height = abs(
+            right_bottom.y -
+            right_top.y
+        )
+
+        if (
+            left_eye_height <= 0
+            or right_eye_height <= 0
+        ):
+            return result
+
+        left_vertical = (
+            left_iris_y -
+            min(
+                left_top.y,
+                left_bottom.y
+            )
+        ) / left_eye_height
+
+        right_vertical = (
+            right_iris_y -
+            min(
+                right_top.y,
+                right_bottom.y
+            )
+        ) / right_eye_height
+
+        vertical = (
+            left_vertical +
+            right_vertical
+        ) / 2.0
+
+        # ----------------------------------------------------
+        # CENTER = ~0.5
+        # ----------------------------------------------------
+
+        horizontal_offset = (
+            horizontal - 0.5
+        )
+
+        vertical_offset = (
+            vertical - 0.5
+        )
+
+        # ----------------------------------------------------
+        # DETERMINE DIRECTION
+        # ----------------------------------------------------
+
+        horizontal_away = (
+            abs(horizontal_offset)
+            > EYE_GAZE_HORIZONTAL_THRESHOLD
+        )
+
+        vertical_away = (
+            abs(vertical_offset)
+            > EYE_GAZE_VERTICAL_THRESHOLD
+        )
+
+        direction = "CENTER"
+
+        if horizontal_away:
+
+            if horizontal_offset < 0:
+                direction = "LEFT"
+            else:
+                direction = "RIGHT"
+
+        elif vertical_away:
+
+            if vertical_offset < 0:
+                direction = "UP"
+            else:
+                direction = "DOWN"
+
+        looking_away = (
+            horizontal_away
+            or vertical_away
+        )
+
+        result.update({
+            "available": True,
+            "looking_away": bool(looking_away),
+            "direction": str(direction),
+
+            "horizontal": float(
+                round(float(horizontal_offset), 3)
+            ),
+
+            "vertical": float(
+                round(float(vertical_offset), 3)
+            ),
+
+            "left_eye": {
+                "horizontal": float(
+                    round(float(left_horizontal), 3)
+                ),
+                "vertical": float(
+                    round(float(left_vertical), 3)
+                )
+            },
+
+            "right_eye": {
+                "horizontal": float(
+                    round(float(right_horizontal), 3)
+                ),
+                "vertical": float(
+                    round(float(right_vertical), 3)
+                )
+            }
+        })
+
+        return result
+
+    except Exception as e:
+
+        print(
+            "⚠️ Eye gaze detection error:",
+            str(e)
+        )
+
+        return result
+
+def make_json_safe(obj):
+    """
+    Convert NumPy / OpenCV / MediaPipe values
+    into standard JSON-serializable Python values.
+    """
+
+    if isinstance(obj, dict):
+        return {
+            str(key): make_json_safe(value)
+            for key, value in obj.items()
+        }
+
+    if isinstance(obj, (list, tuple)):
+        return [
+            make_json_safe(value)
+            for value in obj
+        ]
+
+    # NumPy scalar -> Python scalar
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+
+    # NumPy array -> Python list
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+
+    return obj
+
